@@ -23,49 +23,54 @@ enum ChunkStage {
 #[derive(Debug, Clone)]
 struct ChunkData {
     data: Vec<u8>,
-    coord: ChunkCoord,
 }
 
 #[derive(Debug)]
 struct PendingChunk {
-    data: ChunkData,
-    stage: ChunkStage,
+    data: std::sync::Mutex<ChunkData>,
+    stage: std::sync::Mutex<ChunkStage>,
+    coord: ChunkCoord,
 }
 
 impl PendingChunk {
     fn new(coord: ChunkCoord) -> Self {
         Self {
-            data: ChunkData {
+            data: std::sync::Mutex::new(ChunkData {
                 data: vec![0; 1024],
-                coord,
-            },
-            stage: ChunkStage::Empty,
+            }),
+            stage: std::sync::Mutex::new(ChunkStage::Empty),
+            coord,
         }
     }
 
     // Simulate, empty -> stage 1 (100ms) -> full (100ms)
-    fn advance_to_stage(&mut self, stage: ChunkStage) {
+    fn advance_to_stage(
+        &self,
+        stage: ChunkStage,
+        pending_chunks: &Arc<DashMap<ChunkCoord, Arc<PendingChunk>>>,
+    ) {
+        let mut self_stage = self.stage.lock().unwrap();
         match stage {
             ChunkStage::Stage1 => {
-                if self.stage == ChunkStage::Empty {
+                if *self_stage == ChunkStage::Empty {
                     std::thread::sleep(std::time::Duration::from_millis(100));
-                    self.stage = ChunkStage::Stage1;
+                    *self_stage = ChunkStage::Stage1;
                 } else {
                     panic!("Bad planning");
                 }
             }
             ChunkStage::Stage2 => {
-                if self.stage == ChunkStage::Stage1 {
+                if *self_stage == ChunkStage::Stage1 {
                     std::thread::sleep(std::time::Duration::from_millis(100));
-                    self.stage = ChunkStage::Stage2;
+                    *self_stage = ChunkStage::Stage2;
                 } else {
                     panic!("Bad planning");
                 }
             }
             ChunkStage::Full => {
-                if self.stage == ChunkStage::Stage2 {
+                if *self_stage == ChunkStage::Stage2 {
                     std::thread::sleep(std::time::Duration::from_millis(100));
-                    self.stage = ChunkStage::Full;
+                    *self_stage = ChunkStage::Full;
                 } else {
                     panic!("Bad planning");
                 }
@@ -74,16 +79,17 @@ impl PendingChunk {
         }
     }
 
-    fn advance(&mut self) {
-        match self.stage {
+    fn advance(&self, pending_chunks: &Arc<DashMap<ChunkCoord, Arc<PendingChunk>>>) {
+        let self_stage = self.stage.lock().unwrap().clone();
+        match self_stage {
             ChunkStage::Empty => {
-                self.advance_to_stage(ChunkStage::Stage1);
+                self.advance_to_stage(ChunkStage::Stage1, pending_chunks);
             }
             ChunkStage::Stage1 => {
-                self.advance_to_stage(ChunkStage::Stage2);
+                self.advance_to_stage(ChunkStage::Stage2, pending_chunks);
             }
             ChunkStage::Stage2 => {
-                self.advance_to_stage(ChunkStage::Full);
+                self.advance_to_stage(ChunkStage::Full, pending_chunks);
             }
             ChunkStage::Full => {
                 // No advance
@@ -119,7 +125,8 @@ impl PendingChunk {
 
         let mut deps = Vec::new();
 
-        match self.stage {
+        let self_stage = self.stage.lock().unwrap().clone();
+        match self_stage {
             ChunkStage::Empty => {
                 // For stage 1, we need all chunks in a 3x3 grid around us to be at least Empty
                 for dx in -1..=1 {
@@ -129,8 +136,8 @@ impl PendingChunk {
                         } // Skip self
                         deps.push((
                             ChunkCoord {
-                                x: self.data.coord.x + dx,
-                                z: self.data.coord.z + dz,
+                                x: self.coord.x + dx,
+                                z: self.coord.z + dz,
                             },
                             ChunkStage::Empty,
                         ));
@@ -146,8 +153,8 @@ impl PendingChunk {
                         } // Skip self
                         deps.push((
                             ChunkCoord {
-                                x: self.data.coord.x + dx,
-                                z: self.data.coord.z + dz,
+                                x: self.coord.x + dx,
+                                z: self.coord.z + dz,
                             },
                             ChunkStage::Stage1,
                         ));
@@ -163,8 +170,8 @@ impl PendingChunk {
                         } // Skip self
                         deps.push((
                             ChunkCoord {
-                                x: self.data.coord.x + dx,
-                                z: self.data.coord.z + dz,
+                                x: self.coord.x + dx,
+                                z: self.coord.z + dz,
                             },
                             ChunkStage::Stage2,
                         ));
@@ -182,7 +189,7 @@ impl PendingChunk {
 
 struct ChunkGenerator {
     loaded_chunks: DashMap<ChunkCoord, ChunkData>,
-    pending_chunks: DashMap<ChunkCoord, PendingChunk>,
+    pending_chunks: Arc<DashMap<ChunkCoord, Arc<PendingChunk>>>,
     chunk_tickets: Arc<Mutex<Vec<ChunkCoord>>>,
     ticket_notify: Arc<Notify>,
     thread_pool: Arc<ThreadPool>,
@@ -195,36 +202,54 @@ fn rayon_chunk_generator(chunk_coord: ChunkCoord, generator: Arc<ChunkGenerator>
             generator
                 .pending_chunks
                 .entry(chunk_coord)
-                .or_insert(PendingChunk::new(chunk_coord))
+                .or_insert(Arc::new(PendingChunk::new(chunk_coord)))
                 .dependants()
         };
 
         dependants.par_iter().for_each(|(coord, stage)| {
-            let mut pending_chunk = generator
-                .pending_chunks
-                .entry(*coord)
-                .or_insert(PendingChunk::new(*coord));
+            let pending_chunk = {
+                generator
+                    .pending_chunks
+                    .entry(*coord)
+                    .or_insert(Arc::new(PendingChunk::new(*coord)))
+                    .clone()
+            };
 
-            pending_chunk.advance_to_stage(*stage);
+            pending_chunk.advance_to_stage(*stage, &generator.pending_chunks);
         });
 
-        let mut pending_chunk = generator.pending_chunks.get_mut(&chunk_coord).unwrap();
+        let pending_chunk = {
+            generator
+                .pending_chunks
+                .entry(chunk_coord)
+                .or_insert(Arc::new(PendingChunk::new(chunk_coord)))
+                .clone()
+        };
 
-        pending_chunk.advance();
+        pending_chunk.advance(&generator.pending_chunks);
 
-        if pending_chunk.stage == ChunkStage::Full {
+        if *pending_chunk.stage.lock().unwrap() == ChunkStage::Full {
             drop(pending_chunk);
 
             let pending_chunk = generator.pending_chunks.remove(&chunk_coord).unwrap();
             generator
                 .loaded_chunks
-                .insert(chunk_coord, pending_chunk.1.data);
+                .insert(chunk_coord, pending_chunk.1.data.lock().unwrap().clone());
             break;
         }
     }
 
     // Pretty print the pending chunks in a grid format
-    pretty_print_chunks_around(chunk_coord, 2, &generator);
+    pretty_print_chunks_around(chunk_coord, 3, &generator);
+}
+
+fn into_key(stage: ChunkStage) -> &'static str {
+    match stage {
+        ChunkStage::Empty => " 0️⃣",
+        ChunkStage::Stage1 => " 1️⃣",
+        ChunkStage::Stage2 => " 2️⃣",
+        ChunkStage::Full => " 3️⃣",
+    }
 }
 
 fn pretty_print_chunks_around(center: ChunkCoord, radius: i32, generator: &Arc<ChunkGenerator>) {
@@ -233,9 +258,9 @@ fn pretty_print_chunks_around(center: ChunkCoord, radius: i32, generator: &Arc<C
             let coord = ChunkCoord { x, z };
             let chunk = generator.pending_chunks.get(&coord);
             if let Some(chunk) = chunk {
-                print!("{}", chunk.stage as u8);
+                print!("{}", into_key(*chunk.stage.lock().unwrap()));
             } else {
-                print!(".");
+                print!(" #️⃣");
             }
         }
         println!();
@@ -246,7 +271,7 @@ impl ChunkGenerator {
     fn new() -> Arc<Self> {
         let generator = Arc::new(Self {
             loaded_chunks: DashMap::new(),
-            pending_chunks: DashMap::new(),
+            pending_chunks: Arc::new(DashMap::new()),
             chunk_tickets: Arc::new(Mutex::new(Vec::new())),
             ticket_notify: Arc::new(Notify::new()),
             thread_pool: Arc::new(

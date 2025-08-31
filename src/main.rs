@@ -1,9 +1,8 @@
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use dashmap::DashMap;
-use rayon::iter::ParallelIterator;
-use rayon::{ThreadPool, ThreadPoolBuilder, iter::IntoParallelRefIterator};
-use tokio::sync::{Mutex, Notify};
+use rayon::{ThreadPool, ThreadPoolBuilder};
+use tokio::sync::Notify;
 use tokio::task::JoinHandle;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -27,11 +26,15 @@ struct ChunkData {
 }
 
 #[derive(Debug)]
-struct PendingChunk {
-    data: std::sync::Mutex<ChunkData>,
-    stage: std::sync::Mutex<ChunkStage>,
+struct ChunkState {
+    stage: ChunkStage,
+    data: ChunkData,
+}
+
+#[derive(Debug)]
+struct Chunk {
     coord: ChunkCoord,
-    generation_symaphore: std::sync::Mutex<()>,
+    state: Mutex<ChunkState>,
 }
 
 const fn dependency_radius(chunk_stage: ChunkStage) -> i32 {
@@ -44,155 +47,87 @@ const fn dependency_radius(chunk_stage: ChunkStage) -> i32 {
     }
 }
 
-impl PendingChunk {
+impl Chunk {
     fn new(coord: ChunkCoord) -> Self {
         Self {
-            data: std::sync::Mutex::new(ChunkData {
-                data: vec![0; 1024],
-            }),
-            stage: std::sync::Mutex::new(ChunkStage::Empty),
             coord,
-            generation_symaphore: std::sync::Mutex::new(()),
+            state: Mutex::new(ChunkState {
+                stage: ChunkStage::Empty,
+                data: ChunkData {
+                    data: vec![0; 1024],
+                },
+            }),
         }
     }
 
-    // Simulate, empty -> stage 1 (100ms) -> full (100ms)
-    fn advance_to_stage(&self, stage: ChunkStage, chunks: &Arc<DashMap<ChunkCoord, ChunkState>>) {
+    fn advance_to_stage(
+        &self,
+        target_stage: ChunkStage,
+        chunks: &Arc<DashMap<ChunkCoord, Arc<Chunk>>>,
+    ) {
         loop {
-            let current_stage = {
-                let stage_guard = self.stage.lock().unwrap();
-                *stage_guard
-            };
-            if current_stage >= stage {
-                break;
+            let current_stage = self.state.lock().unwrap().stage;
+
+            if current_stage >= target_stage {
+                return;
             }
 
-            let advanced = self.advance(chunks, current_stage);
-            if !advanced {
-                let _lock = self.generation_symaphore.lock().unwrap();
+            let next_stage_deps = self.get_dependants(current_stage);
+
+            for (coord, required_stage) in next_stage_deps {
+                let dependency_chunk = chunks
+                    .entry(coord)
+                    .or_insert_with(|| Arc::new(Chunk::new(coord)))
+                    .clone();
+
+                dependency_chunk.advance_to_stage(required_stage, chunks);
+            }
+
+            let mut state = self.state.lock().unwrap();
+
+            // Check for race conditions.
+            if state.stage != current_stage {
                 continue;
             }
-        }
-    }
 
-    fn advance(
-        &self,
-        chunks: &Arc<DashMap<ChunkCoord, ChunkState>>,
-        expected_current_stage: ChunkStage,
-    ) -> bool {
-        let lock = self.generation_symaphore.lock();
-        let self_stage = self.stage.lock().unwrap();
-
-        if *self_stage != expected_current_stage {
-            return false; // Stage has changed since we checked
-        }
-        match *self_stage {
-            ChunkStage::Empty => {
-                drop(self_stage);
-                std::thread::sleep(std::time::Duration::from_millis(100));
-                *self.stage.lock().unwrap() = ChunkStage::Stage1;
-                drop(lock);
-                true
-            }
-            ChunkStage::Stage1 => {
-                drop(self_stage);
-
-                self.dependants().par_iter().for_each(|(coord, stage)| {
-                    let pending_chunk = {
-                        let chunk_entry = chunks
-                            .entry(*coord)
-                            .or_insert(ChunkState::Pending(Arc::new(PendingChunk::new(*coord))));
-                        match chunk_entry.value() {
-                            ChunkState::Pending(chunk) => chunk.clone(),
-                            ChunkState::Loaded(_) => panic!(
-                                "Chunk {:?} is already loaded (Can't be at this stage)",
-                                coord
-                            ),
-                        }
-                    };
-                    pending_chunk.advance_to_stage(*stage, chunks);
-                });
-
-                match chunks
-                    .get(&ChunkCoord {
+            match state.stage {
+                ChunkStage::Empty => {
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                    state.stage = ChunkStage::Stage1;
+                }
+                ChunkStage::Stage1 => {
+                    // Example of using a dependency's data
+                    if let Some(neighbor) = chunks.get(&ChunkCoord {
                         x: self.coord.x + 1,
                         z: self.coord.z + 1,
-                    })
-                    .unwrap()
-                    .value()
-                {
-                    ChunkState::Pending(chunk) => {
-                        chunk.data.lock().unwrap().data = vec![1; 1024];
+                    }) {
+                        neighbor.state.lock().unwrap().data.data = vec![1; 1024];
                     }
-                    ChunkState::Loaded(_) => {
-                        unreachable!();
-                    }
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                    state.stage = ChunkStage::Stage2;
+                    println!("Stage 1 -> 2 advanced {:?}", self.coord);
                 }
-
-                std::thread::sleep(std::time::Duration::from_millis(100));
-
-                *self.stage.lock().unwrap() = ChunkStage::Stage2;
-                drop(lock);
-                println!("Stage 1 advanced {:?}", self.coord);
-                true
-            }
-            ChunkStage::Stage2 => {
-                drop(self_stage);
-
-                self.dependants().iter().for_each(|(coord, stage)| {
-                    let pending_chunk = {
-                        let chunk_entry = chunks
-                            .entry(*coord)
-                            .or_insert(ChunkState::Pending(Arc::new(PendingChunk::new(*coord))));
-                        match chunk_entry.value() {
-                            ChunkState::Pending(chunk) => chunk.clone(),
-                            ChunkState::Loaded(_) => return,
-                        }
-                    };
-                    pending_chunk.advance_to_stage(*stage, chunks);
-                });
-
-                std::thread::sleep(std::time::Duration::from_millis(100));
-                *self.stage.lock().unwrap() = ChunkStage::Stage3;
-                drop(lock);
-                println!("Stage 2 advanced {:?}", self.coord);
-                true
-            }
-            ChunkStage::Stage3 => {
-                drop(self_stage);
-
-                self.dependants().iter().for_each(|(coord, stage)| {
-                    let pending_chunk = {
-                        let chunk_entry = chunks
-                            .entry(*coord)
-                            .or_insert(ChunkState::Pending(Arc::new(PendingChunk::new(*coord))));
-                        match chunk_entry.value() {
-                            ChunkState::Pending(chunk) => chunk.clone(),
-                            ChunkState::Loaded(_) => return,
-                        }
-                    };
-                    pending_chunk.advance_to_stage(*stage, chunks);
-                });
-
-                std::thread::sleep(std::time::Duration::from_millis(100));
-                *self.stage.lock().unwrap() = ChunkStage::Full;
-                drop(lock);
-                println!("Stage 3 advanced {:?}", self.coord);
-                true
-            }
-            ChunkStage::Full => {
-                // Already at max stage, no advancement needed
-                drop(lock);
-                true
+                ChunkStage::Stage2 => {
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                    state.stage = ChunkStage::Stage3;
+                    println!("Stage 2 -> 3 advanced {:?}", self.coord);
+                }
+                ChunkStage::Stage3 => {
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                    state.stage = ChunkStage::Full;
+                    println!("Stage 3 -> Full advanced {:?}", self.coord);
+                }
+                ChunkStage::Full => {
+                    // Should not happen due to the check at the top, but is safe.
+                }
             }
         }
     }
 
-    fn dependants(&self) -> Vec<(ChunkCoord, ChunkStage)> {
+    // Helper to get dependencies for the *next* stage transition.
+    fn get_dependants(&self, current_stage: ChunkStage) -> Vec<(ChunkCoord, ChunkStage)> {
         let mut deps = Vec::new();
-
-        let self_stage = self.stage.lock().unwrap().clone();
-        let dep_radius = dependency_radius(self_stage);
+        let dep_radius = dependency_radius(current_stage);
 
         if dep_radius == 0 {
             return deps;
@@ -202,87 +137,59 @@ impl PendingChunk {
             for dz in -dep_radius..=dep_radius {
                 if dx == 0 && dz == 0 {
                     continue;
-                } // Skip self
+                }
                 deps.push((
                     ChunkCoord {
                         x: self.coord.x + dx,
                         z: self.coord.z + dz,
                     },
-                    self_stage.clone(),
+                    current_stage, // The dependency must be at least at our current stage
                 ));
             }
         }
-
         deps
     }
 }
 
-#[derive(Debug)]
-enum ChunkState {
-    Pending(Arc<PendingChunk>),
-    Loaded(ChunkData),
-}
-
 struct ChunkGenerator {
-    chunks: Arc<DashMap<ChunkCoord, ChunkState>>,
-    chunk_tickets: Arc<Mutex<Vec<ChunkCoord>>>,
+    chunks: Arc<DashMap<ChunkCoord, Arc<Chunk>>>,
+    chunk_tickets: Arc<tokio::sync::Mutex<Vec<ChunkCoord>>>,
     ticket_notify: Arc<Notify>,
     thread_pool: Arc<ThreadPool>,
-    handles: Arc<Mutex<Vec<JoinHandle<()>>>>,
+    handles: Arc<tokio::sync::Mutex<Vec<JoinHandle<()>>>>,
 }
 
 fn rayon_chunk_generator(chunk_coord: ChunkCoord, generator: Arc<ChunkGenerator>) {
-    let pending_chunk = {
-        let chunk_entry = generator
-            .chunks
-            .entry(chunk_coord)
-            .or_insert(ChunkState::Pending(Arc::new(PendingChunk::new(
-                chunk_coord,
-            ))));
+    let chunk = generator
+        .chunks
+        .entry(chunk_coord)
+        .or_insert_with(|| Arc::new(Chunk::new(chunk_coord)))
+        .clone();
 
-        match chunk_entry.value() {
-            ChunkState::Pending(chunk) => Some(chunk.clone()),
-            ChunkState::Loaded(_) => None,
-        }
-    };
+    chunk.advance_to_stage(ChunkStage::Full, &generator.chunks);
 
-    if let Some(chunk) = pending_chunk {
-        chunk.advance_to_stage(ChunkStage::Full, &generator.chunks);
-
-        generator.chunks.insert(
-            chunk_coord,
-            ChunkState::Loaded(chunk.data.lock().unwrap().clone()),
-        );
-
-        println!("Chunk {:?} generated", chunk_coord);
-    } else {
-        println!("Chunk {:?} already loaded", chunk_coord);
-    }
+    println!("Chunk {:?} generated", chunk_coord);
 }
 
 fn into_key(stage: ChunkStage) -> &'static str {
     match stage {
-        ChunkStage::Empty => " 0️⃣",
-        ChunkStage::Stage1 => " 1️⃣",
-        ChunkStage::Stage2 => " 2️⃣",
-        ChunkStage::Stage3 => " 3️⃣",
-        ChunkStage::Full => " 4️⃣",
+        ChunkStage::Empty => "🟫",
+        ChunkStage::Stage1 => "🟦",
+        ChunkStage::Stage2 => "🟧",
+        ChunkStage::Stage3 => "🟨",
+        ChunkStage::Full => "🟩",
     }
 }
 
 fn pretty_print_chunks_around(center: ChunkCoord, radius: i32, generator: &Arc<ChunkGenerator>) {
-    for x in center.x - radius..=center.x + radius {
-        for z in center.z - radius..=center.z + radius {
+    for z in center.z - radius..=center.z + radius {
+        for x in center.x - radius..=center.x + radius {
             let coord = ChunkCoord { x, z };
-            let chunk = generator.chunks.get(&coord);
-            if let Some(chunk) = chunk {
-                if let ChunkState::Pending(chunk) = chunk.value() {
-                    print!("{}", into_key(*chunk.stage.lock().unwrap()));
-                } else {
-                    print!(" 9️⃣");
-                }
+            if let Some(chunk) = generator.chunks.get(&coord) {
+                let stage = chunk.state.lock().unwrap().stage;
+                print!("{}", into_key(stage));
             } else {
-                print!(" #️⃣");
+                print!("🟫");
             }
         }
         println!();
@@ -293,7 +200,7 @@ impl ChunkGenerator {
     fn new() -> Arc<Self> {
         let generator = Arc::new(Self {
             chunks: Arc::new(DashMap::new()),
-            chunk_tickets: Arc::new(Mutex::new(Vec::new())),
+            chunk_tickets: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             ticket_notify: Arc::new(Notify::new()),
             thread_pool: Arc::new(
                 ThreadPoolBuilder::new()
@@ -301,16 +208,17 @@ impl ChunkGenerator {
                     .build()
                     .unwrap(),
             ),
-            handles: Arc::new(Mutex::new(Vec::new())),
+            handles: Arc::new(tokio::sync::Mutex::new(Vec::new())),
         });
 
         let generator_clone = generator.clone();
-        let thread_pool_clone = generator.thread_pool.clone();
-        let handle = tokio::spawn(async move {
+        tokio::spawn(async move {
             loop {
-                if let Some(coord) = generator.chunk_tickets.lock().await.pop() {
+                let maybe_coord = generator.chunk_tickets.lock().await.pop();
+
+                if let Some(coord) = maybe_coord {
                     let generator_clone = generator.clone();
-                    thread_pool_clone.spawn(move || {
+                    generator.thread_pool.spawn(move || {
                         rayon_chunk_generator(coord, generator_clone);
                     });
                 } else {
@@ -319,16 +227,12 @@ impl ChunkGenerator {
             }
         });
 
-        generator_clone.handles.try_lock().unwrap().push(handle);
-
         generator_clone
     }
 
-    async fn request_chunk(&self, coord: ChunkCoord) -> Result<(), String> {
-        let mut tickets = self.chunk_tickets.lock().await;
-        tickets.push(coord);
+    async fn request_chunk(&self, coord: ChunkCoord) {
+        self.chunk_tickets.lock().await.push(coord);
         self.ticket_notify.notify_one();
-        Ok(())
     }
 }
 
@@ -336,19 +240,16 @@ impl ChunkGenerator {
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let generator = ChunkGenerator::new();
 
-    for x in -1..=1 {
-        for z in -1..=1 {
-            generator.request_chunk(ChunkCoord { x, z }).await.unwrap();
+    for x in -4..=4 {
+        for z in -4..=4 {
+            generator.request_chunk(ChunkCoord { x, z }).await;
         }
     }
 
     tokio::time::sleep(std::time::Duration::from_secs(6)).await;
 
-    pretty_print_chunks_around(ChunkCoord { x: 0, z: 0 }, 6, &generator);
-
-    for handle in generator.handles.lock().await.drain(..) {
-        handle.await.unwrap();
-    }
+    println!("Final chunk states:");
+    pretty_print_chunks_around(ChunkCoord { x: 0, z: 0 }, 10, &generator);
 
     println!("All Chunks Generated");
 

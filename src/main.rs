@@ -67,12 +67,7 @@ impl PendingChunk {
 
             let advanced = self.advance(chunks, current_stage);
             if !advanced {
-                println!(
-                    "Chunk {:?} is at stage {:?}, expected stage {:?}",
-                    self.coord, current_stage, stage
-                );
                 let _lock = self.generation_symaphore.lock().unwrap();
-                println!("Continuing");
                 continue;
             }
         }
@@ -83,12 +78,7 @@ impl PendingChunk {
         chunks: &Arc<DashMap<ChunkCoord, ChunkState>>,
         expected_current_stage: ChunkStage,
     ) -> bool {
-        let lock = match self.generation_symaphore.try_lock() {
-            Ok(lock) => lock,
-            Err(_) => {
-                return false; // Another thread is working on this chunk
-            }
-        };
+        let lock = self.generation_symaphore.lock();
         let self_stage = self.stage.lock().unwrap();
 
         if *self_stage != expected_current_stage {

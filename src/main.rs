@@ -192,63 +192,24 @@ impl PendingChunk {
         let mut deps = Vec::new();
 
         let self_stage = self.stage.lock().unwrap().clone();
-        match self_stage {
-            ChunkStage::Empty => {
-                // No dependencies when empty
-            }
-            ChunkStage::Stage1 => {
-                // For full generation, we need all chunks in a 3x3 grid to be at Stage1
-                for dx in -dependency_radius(self_stage)..=dependency_radius(self_stage) {
-                    for dz in -dependency_radius(self_stage)..=dependency_radius(self_stage) {
-                        if dx == 0 && dz == 0 {
-                            continue;
-                        } // Skip self
-                        deps.push((
-                            ChunkCoord {
-                                x: self.coord.x + dx,
-                                z: self.coord.z + dz,
-                            },
-                            ChunkStage::Stage1,
-                        ));
-                    }
-                }
-            }
-            ChunkStage::Stage2 => {
-                // For full generation, we need all chunks in a 3x3 grid to be at Stage1
-                for dx in -dependency_radius(self_stage)..=dependency_radius(self_stage) {
-                    for dz in -dependency_radius(self_stage)..=dependency_radius(self_stage) {
-                        if dx == 0 && dz == 0 {
-                            continue;
-                        } // Skip self
-                        deps.push((
-                            ChunkCoord {
-                                x: self.coord.x + dx,
-                                z: self.coord.z + dz,
-                            },
-                            ChunkStage::Stage2,
-                        ));
-                    }
-                }
-            }
-            ChunkStage::Stage3 => {
-                // For full generation, we need all chunks in a 3x3 grid to be at Stage2
-                for dx in -dependency_radius(self_stage)..=dependency_radius(self_stage) {
-                    for dz in -dependency_radius(self_stage)..=dependency_radius(self_stage) {
-                        if dx == 0 && dz == 0 {
-                            continue;
-                        } // Skip self
-                        deps.push((
-                            ChunkCoord {
-                                x: self.coord.x + dx,
-                                z: self.coord.z + dz,
-                            },
-                            ChunkStage::Stage3,
-                        ));
-                    }
-                }
-            }
-            ChunkStage::Full => {
-                // No dependencies when already full
+        let dep_radius = dependency_radius(self_stage);
+
+        if dep_radius == 0 {
+            return deps;
+        }
+
+        for dx in -dep_radius..=dep_radius {
+            for dz in -dep_radius..=dep_radius {
+                if dx == 0 && dz == 0 {
+                    continue;
+                } // Skip self
+                deps.push((
+                    ChunkCoord {
+                        x: self.coord.x + dx,
+                        z: self.coord.z + dz,
+                    },
+                    self_stage.clone(),
+                ));
             }
         }
 

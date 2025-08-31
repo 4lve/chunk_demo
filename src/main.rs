@@ -12,7 +12,7 @@ struct ChunkCoord {
     z: i32,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 enum ChunkStage {
     Empty,
     Stage1,
@@ -32,6 +32,15 @@ struct PendingChunk {
     coord: ChunkCoord,
 }
 
+const fn dependency_radius(chunk_stage: ChunkStage) -> i32 {
+    match chunk_stage {
+        ChunkStage::Empty => 0,
+        ChunkStage::Stage1 => 1,
+        ChunkStage::Stage2 => 1,
+        ChunkStage::Full => 0,
+    }
+}
+
 impl PendingChunk {
     fn new(coord: ChunkCoord) -> Self {
         Self {
@@ -49,47 +58,45 @@ impl PendingChunk {
         stage: ChunkStage,
         pending_chunks: &Arc<DashMap<ChunkCoord, Arc<PendingChunk>>>,
     ) {
-        let mut self_stage = self.stage.lock().unwrap();
-        match stage {
-            ChunkStage::Stage1 => {
-                if *self_stage == ChunkStage::Empty {
-                    std::thread::sleep(std::time::Duration::from_millis(100));
-                    *self_stage = ChunkStage::Stage1;
-                } else {
-                    panic!("Bad planning");
-                }
-            }
-            ChunkStage::Stage2 => {
-                if *self_stage == ChunkStage::Stage1 {
-                    std::thread::sleep(std::time::Duration::from_millis(100));
-                    *self_stage = ChunkStage::Stage2;
-                } else {
-                    panic!("Bad planning");
-                }
-            }
-            ChunkStage::Full => {
-                if *self_stage == ChunkStage::Stage2 {
-                    std::thread::sleep(std::time::Duration::from_millis(100));
-                    *self_stage = ChunkStage::Full;
-                } else {
-                    panic!("Bad planning");
-                }
-            }
-            _ => {}
+        while *self.stage.lock().unwrap() < stage {
+            self.advance(pending_chunks);
         }
     }
 
     fn advance(&self, pending_chunks: &Arc<DashMap<ChunkCoord, Arc<PendingChunk>>>) {
-        let self_stage = self.stage.lock().unwrap().clone();
-        match self_stage {
+        let mut self_stage = self.stage.lock().unwrap();
+        match *self_stage {
             ChunkStage::Empty => {
-                self.advance_to_stage(ChunkStage::Stage1, pending_chunks);
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                *self_stage = ChunkStage::Stage1;
             }
             ChunkStage::Stage1 => {
-                self.advance_to_stage(ChunkStage::Stage2, pending_chunks);
+                drop(self_stage);
+
+                self.dependants().par_iter().for_each(|(coord, stage)| {
+                    let pending_chunk = {
+                        pending_chunks
+                            .entry(*coord)
+                            .or_insert(Arc::new(PendingChunk::new(*coord)))
+                            .clone()
+                    };
+                    println!("Advancing dependant chunk {:?} to stage {:?}", coord, stage);
+                    pending_chunk.advance_to_stage(*stage, pending_chunks);
+                });
+
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                *self.stage.lock().unwrap() = ChunkStage::Stage2;
             }
             ChunkStage::Stage2 => {
-                self.advance_to_stage(ChunkStage::Full, pending_chunks);
+                drop(self_stage);
+
+                self.dependants().par_iter().for_each(|(coord, stage)| {
+                    let pending_chunk = pending_chunks.get(coord).unwrap().clone();
+                    pending_chunk.advance_to_stage(*stage, pending_chunks);
+                });
+
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                *self.stage.lock().unwrap() = ChunkStage::Full;
             }
             ChunkStage::Full => {
                 // No advance
@@ -197,47 +204,15 @@ struct ChunkGenerator {
 }
 
 fn rayon_chunk_generator(chunk_coord: ChunkCoord, generator: Arc<ChunkGenerator>) {
-    loop {
-        let dependants = {
-            generator
-                .pending_chunks
-                .entry(chunk_coord)
-                .or_insert(Arc::new(PendingChunk::new(chunk_coord)))
-                .dependants()
-        };
+    let pending_chunk = {
+        generator
+            .pending_chunks
+            .entry(chunk_coord)
+            .or_insert(Arc::new(PendingChunk::new(chunk_coord)))
+            .clone()
+    };
 
-        dependants.par_iter().for_each(|(coord, stage)| {
-            let pending_chunk = {
-                generator
-                    .pending_chunks
-                    .entry(*coord)
-                    .or_insert(Arc::new(PendingChunk::new(*coord)))
-                    .clone()
-            };
-
-            pending_chunk.advance_to_stage(*stage, &generator.pending_chunks);
-        });
-
-        let pending_chunk = {
-            generator
-                .pending_chunks
-                .entry(chunk_coord)
-                .or_insert(Arc::new(PendingChunk::new(chunk_coord)))
-                .clone()
-        };
-
-        pending_chunk.advance(&generator.pending_chunks);
-
-        if *pending_chunk.stage.lock().unwrap() == ChunkStage::Full {
-            drop(pending_chunk);
-
-            let pending_chunk = generator.pending_chunks.remove(&chunk_coord).unwrap();
-            generator
-                .loaded_chunks
-                .insert(chunk_coord, pending_chunk.1.data.lock().unwrap().clone());
-            break;
-        }
-    }
+    pending_chunk.advance_to_stage(ChunkStage::Full, &generator.pending_chunks);
 
     // Pretty print the pending chunks in a grid format
     pretty_print_chunks_around(chunk_coord, 3, &generator);

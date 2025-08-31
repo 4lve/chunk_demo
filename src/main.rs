@@ -1,6 +1,7 @@
 use std::sync::{Arc, Mutex};
 
 use dashmap::DashMap;
+use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
 use rayon::{ThreadPool, ThreadPoolBuilder};
 use tokio::sync::Notify;
 use tokio::task::JoinHandle;
@@ -35,13 +36,14 @@ struct ChunkState {
 struct Chunk {
     coord: ChunkCoord,
     state: Mutex<ChunkState>,
+    notify_full: Notify,
 }
 
 const fn dependency_radius(chunk_stage: ChunkStage) -> i32 {
     match chunk_stage {
         ChunkStage::Empty => 0,
         ChunkStage::Stage1 => 1,
-        ChunkStage::Stage2 => 1,
+        ChunkStage::Stage2 => 2,
         ChunkStage::Stage3 => 1,
         ChunkStage::Full => 0,
     }
@@ -57,6 +59,7 @@ impl Chunk {
                     data: vec![0; 1024],
                 },
             }),
+            notify_full: Notify::new(),
         }
     }
 
@@ -74,14 +77,16 @@ impl Chunk {
 
             let next_stage_deps = self.get_dependants(current_stage);
 
-            for (coord, required_stage) in next_stage_deps {
-                let dependency_chunk = chunks
-                    .entry(coord)
-                    .or_insert_with(|| Arc::new(Chunk::new(coord)))
-                    .clone();
+            next_stage_deps
+                .par_iter()
+                .for_each(|(coord, required_stage)| {
+                    let dependency_chunk = chunks
+                        .entry(*coord)
+                        .or_insert_with(|| Arc::new(Chunk::new(*coord)))
+                        .clone();
 
-                dependency_chunk.advance_to_stage(required_stage, chunks);
-            }
+                    dependency_chunk.advance_to_stage(*required_stage, chunks);
+                });
 
             let mut state = self.state.lock().unwrap();
 
@@ -116,6 +121,7 @@ impl Chunk {
                     std::thread::sleep(std::time::Duration::from_millis(100));
                     state.stage = ChunkStage::Full;
                     println!("Stage 3 -> Full advanced {:?}", self.coord);
+                    self.notify_full.notify_waiters();
                 }
                 ChunkStage::Full => {
                     // Should not happen due to the check at the top, but is safe.
@@ -234,6 +240,23 @@ impl ChunkGenerator {
         self.chunk_tickets.lock().await.push(coord);
         self.ticket_notify.notify_one();
     }
+
+    pub async fn wait_for_chunk(&self, coord: ChunkCoord) -> Arc<Chunk> {
+        let chunk = self
+            .chunks
+            .entry(coord)
+            .or_insert_with(|| Arc::new(Chunk::new(coord)))
+            .clone();
+
+        loop {
+            if chunk.state.lock().unwrap().stage == ChunkStage::Full {
+                return chunk;
+            }
+            let notified = chunk.notify_full.notified();
+
+            notified.await;
+        }
+    }
 }
 
 #[tokio::main]
@@ -246,7 +269,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    tokio::time::sleep(std::time::Duration::from_secs(6)).await;
+    for x in -4..=4 {
+        for z in -4..=4 {
+            let _chunk = generator.wait_for_chunk(ChunkCoord { x, z }).await;
+        }
+    }
 
     println!("Final chunk states:");
     pretty_print_chunks_around(ChunkCoord { x: 0, z: 0 }, 10, &generator);

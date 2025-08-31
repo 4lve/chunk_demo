@@ -34,9 +34,9 @@ struct PendingChunk {
 
 const fn dependency_radius(chunk_stage: ChunkStage) -> i32 {
     match chunk_stage {
-        ChunkStage::Empty => 0,
-        ChunkStage::Stage1 => 1,
-        ChunkStage::Stage2 => 1,
+        ChunkStage::Empty => 1,
+        ChunkStage::Stage1 => 2,
+        ChunkStage::Stage2 => 2,
         ChunkStage::Full => 0,
     }
 }
@@ -136,8 +136,8 @@ impl PendingChunk {
         match self_stage {
             ChunkStage::Empty => {
                 // For stage 1, we need all chunks in a 3x3 grid around us to be at least Empty
-                for dx in -1..=1 {
-                    for dz in -1..=1 {
+                for dx in -dependency_radius(self_stage)..=dependency_radius(self_stage) {
+                    for dz in -dependency_radius(self_stage)..=dependency_radius(self_stage) {
                         if dx == 0 && dz == 0 {
                             continue;
                         } // Skip self
@@ -153,8 +153,8 @@ impl PendingChunk {
             }
             ChunkStage::Stage1 => {
                 // For full generation, we need all chunks in a 3x3 grid to be at Stage1
-                for dx in -1..=1 {
-                    for dz in -1..=1 {
+                for dx in -dependency_radius(self_stage)..=dependency_radius(self_stage) {
+                    for dz in -dependency_radius(self_stage)..=dependency_radius(self_stage) {
                         if dx == 0 && dz == 0 {
                             continue;
                         } // Skip self
@@ -170,8 +170,8 @@ impl PendingChunk {
             }
             ChunkStage::Stage2 => {
                 // For full generation, we need all chunks in a 3x3 grid to be at Stage1
-                for dx in -1..=1 {
-                    for dz in -1..=1 {
+                for dx in -dependency_radius(self_stage)..=dependency_radius(self_stage) {
+                    for dz in -dependency_radius(self_stage)..=dependency_radius(self_stage) {
                         if dx == 0 && dz == 0 {
                             continue;
                         } // Skip self
@@ -215,7 +215,7 @@ fn rayon_chunk_generator(chunk_coord: ChunkCoord, generator: Arc<ChunkGenerator>
     pending_chunk.advance_to_stage(ChunkStage::Full, &generator.pending_chunks);
 
     // Pretty print the pending chunks in a grid format
-    pretty_print_chunks_around(chunk_coord, 3, &generator);
+    pretty_print_chunks_around(chunk_coord, 6, &generator);
 }
 
 fn into_key(stage: ChunkStage) -> &'static str {

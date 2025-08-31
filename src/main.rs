@@ -17,6 +17,7 @@ enum ChunkStage {
     Empty,
     Stage1,
     Stage2,
+    Stage3,
     Full,
 }
 
@@ -38,6 +39,7 @@ const fn dependency_radius(chunk_stage: ChunkStage) -> i32 {
         ChunkStage::Empty => 0,
         ChunkStage::Stage1 => 1,
         ChunkStage::Stage2 => 1,
+        ChunkStage::Stage3 => 1,
         ChunkStage::Full => 0,
     }
 }
@@ -151,9 +153,31 @@ impl PendingChunk {
                 });
 
                 std::thread::sleep(std::time::Duration::from_millis(100));
-                *self.stage.lock().unwrap() = ChunkStage::Full;
+                *self.stage.lock().unwrap() = ChunkStage::Stage3;
                 drop(lock);
                 println!("Stage 2 advanced {:?}", self.coord);
+                true
+            }
+            ChunkStage::Stage3 => {
+                drop(self_stage);
+
+                self.dependants().iter().for_each(|(coord, stage)| {
+                    let pending_chunk = {
+                        let chunk_entry = chunks
+                            .entry(*coord)
+                            .or_insert(ChunkState::Pending(Arc::new(PendingChunk::new(*coord))));
+                        match chunk_entry.value() {
+                            ChunkState::Pending(chunk) => chunk.clone(),
+                            ChunkState::Loaded(_) => return,
+                        }
+                    };
+                    pending_chunk.advance_to_stage(*stage, chunks);
+                });
+
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                *self.stage.lock().unwrap() = ChunkStage::Full;
+                drop(lock);
+                println!("Stage 3 advanced {:?}", self.coord);
                 true
             }
             ChunkStage::Full => {
@@ -202,6 +226,23 @@ impl PendingChunk {
                                 z: self.coord.z + dz,
                             },
                             ChunkStage::Stage2,
+                        ));
+                    }
+                }
+            }
+            ChunkStage::Stage3 => {
+                // For full generation, we need all chunks in a 3x3 grid to be at Stage2
+                for dx in -dependency_radius(self_stage)..=dependency_radius(self_stage) {
+                    for dz in -dependency_radius(self_stage)..=dependency_radius(self_stage) {
+                        if dx == 0 && dz == 0 {
+                            continue;
+                        } // Skip self
+                        deps.push((
+                            ChunkCoord {
+                                x: self.coord.x + dx,
+                                z: self.coord.z + dz,
+                            },
+                            ChunkStage::Stage3,
                         ));
                     }
                 }
@@ -263,7 +304,8 @@ fn into_key(stage: ChunkStage) -> &'static str {
         ChunkStage::Empty => " 0️⃣",
         ChunkStage::Stage1 => " 1️⃣",
         ChunkStage::Stage2 => " 2️⃣",
-        ChunkStage::Full => " 3️⃣",
+        ChunkStage::Stage3 => " 3️⃣",
+        ChunkStage::Full => " 4️⃣",
     }
 }
 

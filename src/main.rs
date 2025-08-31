@@ -162,7 +162,6 @@ struct ChunkGenerator {
     chunk_tickets: Arc<tokio::sync::Mutex<Vec<ChunkCoord>>>,
     ticket_notify: Arc<Notify>,
     thread_pool: Arc<ThreadPool>,
-    handles: Arc<tokio::sync::Mutex<Vec<JoinHandle<()>>>>,
 }
 
 fn rayon_chunk_generator(chunk_coord: ChunkCoord, generator: Arc<ChunkGenerator>) {
@@ -214,7 +213,6 @@ impl ChunkGenerator {
                     .build()
                     .unwrap(),
             ),
-            handles: Arc::new(tokio::sync::Mutex::new(Vec::new())),
         });
 
         let generator_clone = generator.clone();

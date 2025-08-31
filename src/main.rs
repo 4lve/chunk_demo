@@ -3,7 +3,7 @@ use std::sync::Arc;
 use dashmap::DashMap;
 use rayon::iter::ParallelIterator;
 use rayon::{ThreadPool, ThreadPoolBuilder, iter::IntoParallelRefIterator};
-use tokio::sync::{Mutex, Notify, Semaphore};
+use tokio::sync::{Mutex, Notify};
 use tokio::task::JoinHandle;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -30,14 +30,14 @@ struct PendingChunk {
     data: std::sync::Mutex<ChunkData>,
     stage: std::sync::Mutex<ChunkStage>,
     coord: ChunkCoord,
-    generation_symaphore: Mutex<()>,
+    generation_symaphore: std::sync::Mutex<()>,
 }
 
 const fn dependency_radius(chunk_stage: ChunkStage) -> i32 {
     match chunk_stage {
         ChunkStage::Empty => 0,
-        ChunkStage::Stage1 => 2,
-        ChunkStage::Stage2 => 3,
+        ChunkStage::Stage1 => 1,
+        ChunkStage::Stage2 => 1,
         ChunkStage::Full => 0,
     }
 }
@@ -50,7 +50,7 @@ impl PendingChunk {
             }),
             stage: std::sync::Mutex::new(ChunkStage::Empty),
             coord,
-            generation_symaphore: Mutex::new(()),
+            generation_symaphore: std::sync::Mutex::new(()),
         }
     }
 
@@ -64,18 +64,43 @@ impl PendingChunk {
             if current_stage >= stage {
                 break;
             }
-            self.advance(chunks);
+
+            let advanced = self.advance(chunks, current_stage);
+            if !advanced {
+                println!(
+                    "Chunk {:?} is at stage {:?}, expected stage {:?}",
+                    self.coord, current_stage, stage
+                );
+                let _lock = self.generation_symaphore.lock().unwrap();
+                println!("Continuing");
+                continue;
+            }
         }
     }
 
-    fn advance(&self, chunks: &Arc<DashMap<ChunkCoord, ChunkState>>) {
+    fn advance(
+        &self,
+        chunks: &Arc<DashMap<ChunkCoord, ChunkState>>,
+        expected_current_stage: ChunkStage,
+    ) -> bool {
+        let lock = match self.generation_symaphore.try_lock() {
+            Ok(lock) => lock,
+            Err(_) => {
+                return false; // Another thread is working on this chunk
+            }
+        };
         let self_stage = self.stage.lock().unwrap();
-        let _ = self.generation_symaphore.lock();
+
+        if *self_stage != expected_current_stage {
+            return false; // Stage has changed since we checked
+        }
         match *self_stage {
             ChunkStage::Empty => {
                 drop(self_stage);
                 std::thread::sleep(std::time::Duration::from_millis(100));
                 *self.stage.lock().unwrap() = ChunkStage::Stage1;
+                drop(lock);
+                true
             }
             ChunkStage::Stage1 => {
                 drop(self_stage);
@@ -96,14 +121,33 @@ impl PendingChunk {
                     pending_chunk.advance_to_stage(*stage, chunks);
                 });
 
+                match chunks
+                    .get(&ChunkCoord {
+                        x: self.coord.x + 1,
+                        z: self.coord.z + 1,
+                    })
+                    .unwrap()
+                    .value()
+                {
+                    ChunkState::Pending(chunk) => {
+                        chunk.data.lock().unwrap().data = vec![1; 1024];
+                    }
+                    ChunkState::Loaded(_) => {
+                        unreachable!();
+                    }
+                }
+
                 std::thread::sleep(std::time::Duration::from_millis(100));
 
                 *self.stage.lock().unwrap() = ChunkStage::Stage2;
+                drop(lock);
+                println!("Stage 1 advanced {:?}", self.coord);
+                true
             }
             ChunkStage::Stage2 => {
                 drop(self_stage);
 
-                self.dependants().par_iter().for_each(|(coord, stage)| {
+                self.dependants().iter().for_each(|(coord, stage)| {
                     let pending_chunk = {
                         let chunk_entry = chunks
                             .entry(*coord)
@@ -118,9 +162,14 @@ impl PendingChunk {
 
                 std::thread::sleep(std::time::Duration::from_millis(100));
                 *self.stage.lock().unwrap() = ChunkStage::Full;
+                drop(lock);
+                println!("Stage 2 advanced {:?}", self.coord);
+                true
             }
             ChunkStage::Full => {
-                // No advance
+                // Already at max stage, no advancement needed
+                drop(lock);
+                true
             }
         }
     }

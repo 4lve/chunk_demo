@@ -1,4 +1,4 @@
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 
 use dashmap::DashMap;
 use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
@@ -33,23 +33,29 @@ struct ChunkState {
 }
 
 #[derive(Debug)]
-struct Chunk {
+struct PendingChunk {
     coord: ChunkCoord,
     state: Mutex<ChunkState>,
-    notify_full: Notify,
+    notify_full: Arc<Notify>,
+}
+
+#[derive(Debug)]
+enum ChunkEntry {
+    Pending(Arc<PendingChunk>),
+    Full(Arc<RwLock<ChunkData>>),
 }
 
 const fn dependency_radius(chunk_stage: ChunkStage) -> i32 {
     match chunk_stage {
         ChunkStage::Empty => 0,
         ChunkStage::Stage1 => 1,
-        ChunkStage::Stage2 => 2,
+        ChunkStage::Stage2 => 1,
         ChunkStage::Stage3 => 1,
         ChunkStage::Full => 0,
     }
 }
 
-impl Chunk {
+impl PendingChunk {
     fn new(coord: ChunkCoord) -> Self {
         Self {
             coord,
@@ -59,14 +65,14 @@ impl Chunk {
                     data: vec![0; 1024],
                 },
             }),
-            notify_full: Notify::new(),
+            notify_full: Arc::new(Notify::new()),
         }
     }
 
     fn advance_to_stage(
         &self,
         target_stage: ChunkStage,
-        chunks: &Arc<DashMap<ChunkCoord, Arc<Chunk>>>,
+        chunks: &Arc<DashMap<ChunkCoord, ChunkEntry>>,
     ) {
         loop {
             let current_stage = self.state.lock().unwrap().stage;
@@ -80,12 +86,21 @@ impl Chunk {
             next_stage_deps
                 .par_iter()
                 .for_each(|(coord, required_stage)| {
-                    let dependency_chunk = chunks
-                        .entry(*coord)
-                        .or_insert_with(|| Arc::new(Chunk::new(*coord)))
-                        .clone();
+                    let dependency_chunk = {
+                        let dependency_chunk = chunks.entry(*coord).or_insert_with(|| {
+                            ChunkEntry::Pending(Arc::new(PendingChunk::new(*coord)))
+                        });
 
-                    dependency_chunk.advance_to_stage(*required_stage, chunks);
+                        if let ChunkEntry::Pending(chunk) = &*dependency_chunk {
+                            Some(chunk.clone())
+                        } else {
+                            None
+                        }
+                    };
+
+                    if let Some(chunk) = dependency_chunk {
+                        chunk.advance_to_stage(*required_stage, chunks);
+                    }
                 });
 
             let mut state = self.state.lock().unwrap();
@@ -106,7 +121,9 @@ impl Chunk {
                         x: self.coord.x + 1,
                         z: self.coord.z + 1,
                     }) {
-                        neighbor.state.lock().unwrap().data.data = vec![1; 1024];
+                        if let ChunkEntry::Pending(chunk) = &*neighbor {
+                            chunk.state.lock().unwrap().data.data = vec![1; 1024];
+                        }
                     }
                     std::thread::sleep(std::time::Duration::from_millis(100));
                     state.stage = ChunkStage::Stage2;
@@ -121,7 +138,6 @@ impl Chunk {
                     std::thread::sleep(std::time::Duration::from_millis(100));
                     state.stage = ChunkStage::Full;
                     println!("Stage 3 -> Full advanced {:?}", self.coord);
-                    self.notify_full.notify_waiters();
                 }
                 ChunkStage::Full => {
                     // Should not happen due to the check at the top, but is safe.
@@ -158,22 +174,54 @@ impl Chunk {
 }
 
 struct ChunkGenerator {
-    chunks: Arc<DashMap<ChunkCoord, Arc<Chunk>>>,
+    chunks: Arc<DashMap<ChunkCoord, ChunkEntry>>,
     chunk_tickets: Arc<tokio::sync::Mutex<Vec<ChunkCoord>>>,
     ticket_notify: Arc<Notify>,
     thread_pool: Arc<ThreadPool>,
 }
 
 fn rayon_chunk_generator(chunk_coord: ChunkCoord, generator: Arc<ChunkGenerator>) {
-    let chunk = generator
-        .chunks
-        .entry(chunk_coord)
-        .or_insert_with(|| Arc::new(Chunk::new(chunk_coord)))
-        .clone();
+    let chunk = {
+        let chunk = generator
+            .chunks
+            .entry(chunk_coord)
+            .or_insert_with(|| ChunkEntry::Pending(Arc::new(PendingChunk::new(chunk_coord))));
 
-    chunk.advance_to_stage(ChunkStage::Full, &generator.chunks);
+        if let ChunkEntry::Pending(chunk) = &*chunk {
+            Some(chunk.clone())
+        } else {
+            None
+        }
+    };
 
-    println!("Chunk {:?} generated", chunk_coord);
+    if let Some(chunk) = chunk {
+        chunk.advance_to_stage(ChunkStage::Full, &generator.chunks);
+
+        let notify_full = {
+            if let ChunkEntry::Pending(chunk) = &*generator.chunks.get(&chunk_coord).unwrap() {
+                Some(chunk.notify_full.clone())
+            } else {
+                None
+            }
+        };
+
+        if let Some(mut chunk) = generator.chunks.get_mut(&chunk_coord) {
+            take_mut::take(chunk.value_mut(), |chunk| match chunk {
+                ChunkEntry::Pending(chunk) => ChunkEntry::Full(Arc::new(RwLock::new(
+                    chunk.state.lock().unwrap().data.clone(),
+                ))),
+                ChunkEntry::Full(chunk) => ChunkEntry::Full(chunk.clone()),
+            });
+        }
+
+        if let Some(notify_full) = notify_full {
+            notify_full.notify_waiters();
+        }
+
+        println!("Chunk {:?} generated", chunk_coord);
+    } else {
+        println!("Chunk {:?} already exists", chunk_coord);
+    }
 }
 
 fn into_key(stage: ChunkStage) -> &'static str {
@@ -191,7 +239,11 @@ fn pretty_print_chunks_around(center: ChunkCoord, radius: i32, generator: &Arc<C
         for x in center.x - radius..=center.x + radius {
             let coord = ChunkCoord { x, z };
             if let Some(chunk) = generator.chunks.get(&coord) {
-                let stage = chunk.state.lock().unwrap().stage;
+                let stage = if let ChunkEntry::Pending(chunk) = &*chunk {
+                    chunk.state.lock().unwrap().stage
+                } else {
+                    ChunkStage::Full
+                };
                 print!("{}", into_key(stage));
             } else {
                 print!("🟫");
@@ -239,18 +291,28 @@ impl ChunkGenerator {
         self.ticket_notify.notify_one();
     }
 
-    pub async fn wait_for_chunk(&self, coord: ChunkCoord) -> Arc<Chunk> {
-        let chunk = self
-            .chunks
-            .entry(coord)
-            .or_insert_with(|| Arc::new(Chunk::new(coord)))
-            .clone();
-
+    pub async fn wait_for_chunk(&self, coord: ChunkCoord) -> Arc<RwLock<ChunkData>> {
         loop {
-            if chunk.state.lock().unwrap().stage == ChunkStage::Full {
-                return chunk;
+            let chunk = {
+                let chunk = self
+                    .chunks
+                    .entry(coord)
+                    .or_insert_with(|| ChunkEntry::Pending(Arc::new(PendingChunk::new(coord))));
+
+                match &*chunk {
+                    ChunkEntry::Pending(chunk) => ChunkEntry::Pending(chunk.clone()),
+                    ChunkEntry::Full(chunk) => ChunkEntry::Full(chunk.clone()),
+                }
+            };
+
+            if let ChunkEntry::Full(chunk) = chunk {
+                return chunk.clone();
             }
-            let notified = chunk.notify_full.notified();
+            let notified = if let ChunkEntry::Pending(chunk) = &chunk {
+                chunk.notify_full.notified()
+            } else {
+                continue;
+            };
 
             notified.await;
         }
